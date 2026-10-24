@@ -1,0 +1,12 @@
+# macOS metadata
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+
+# Temporary files and editor backups
+*~
+*.swp
+*.swo
+*.tmp
+*.bak

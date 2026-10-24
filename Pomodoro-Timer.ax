@@ -1,0 +1,860 @@
+# @name Pomodoro Timer
+# @desc Distraction-free Pomodoro timer: no scrolling text, no blinking, no seconds while a phase runs. The tomato quietly empties; during breaks, a cup of tea does. Operated with SELECT only.
+# @author Claude for RalfA
+# @version 1.7
+# @config work   slider "Focus" min=5 max=90 default=25 unit=min
+# @config short  slider "Short break" min=1 max=30 default=5 unit=min
+# @config long   slider "Long break" min=5 max=60 default=15 unit=min
+# @config cycles slider "Focus phases before long break" min=2 max=6 default=4
+# @config auto   bool "Start next phase automatically" default=false help="The next phase begins as soon as the previous one ends; the alert plays on top"
+# @config tune   select "Alert tune" options=chime,bells,pips default=chime
+# @config ring   slider "Alert length" min=5 max=120 default=20 unit=s help="How long the alert holds the display. Any button ends it sooner"
+# @config secs   bool "Show seconds" default=false help="Off: only the remaining minutes are shown during a phase, no ticking seconds"
+# @config pin    bool "Pin during a phase" default=true help="Pauses the app rotation while a phase is running or paused. LEFT/RIGHT still switch away and release the rotation"
+# @config sound  bool "Sound" default=true
+# @config wake   bool "Wake the display" default=true help="Switches the matrix on if it is off when a phase ends"
+# @needs audio.rtttl
+# @display 52x16
+
+# Pomodoro timer for the Ulanzi TC002 running AWTRIX NG.
+#
+# Copyright (c) 2026 RalfA. Released under the MIT License, see LICENSE.
+#
+# While a phase is running or paused, the picture stays calm: no
+# scrolling text, no blinking colon, no flash when the seconds change.
+# The only sign of life is a slow breathing (4 s): during focus, the dot
+# of the current phase; during a break, the steam above the cup. When
+# paused, that stops as well. Without "Show seconds" only the remaining
+# minutes are shown (rounded up), so the digits change just once a
+# minute. Movement only happens when idle and during the alert - that is
+# when it is meant to catch the eye.
+#
+# In minutes mode two large digits (13x16) fill the entire right half;
+# the progress bar and text are dropped. When paused, the digits are
+# merely dimmed.
+#
+# Pinning: with "Pin during a phase" the app pauses the rotation on start
+# so that no other apps cut in. It is released at the end of a phase
+# (after the alert), on cancel, and as soon as you switch away with
+# LEFT/RIGHT. Come back during the phase and it pins itself again.
+#
+# Auto mode: with "Start next phase automatically" the next phase counts
+# from the moment the previous one ends. The alert just plays on top;
+# after a 20 s alert, 4:40 of a 5 min break remain.
+#
+# Sequence: focus -> short break -> focus -> short break ... and after
+# the configured number of focus phases, a long break. The dots below the
+# tomato show how many focus phases of the current set are done.
+#
+# Controls (SELECT only, LEFT/RIGHT stay free for the app rotation):
+#   SELECT once         starts the shown phase / pause / resume
+#   SELECT twice        running: cancel the phase (counter kept)
+#                       idle:    reset everything to focus, counter 0
+#   during the alert    SELECT starts the next phase,
+#                       LEFT/RIGHT only silence the alert
+#
+# Time is checked against now_ms() in loop(), not counted in frames, so a
+# timer keeps correct time even while the app is not on screen. A running
+# timer is saved every 15 s and survives a restart once the clock knows
+# the time again.
+#
+# States:  0 ready   1 running   2 paused   3 alert
+# Phases:  0 focus   1 short break   2 long break
+
+class App
+  # settings
+  var focus_s, short_s, long_s, cycles, auto, tune, ring_s
+  var sound_on, wake, secs, pin
+  # timer
+  var state, phase, done, ended, length_s, deadline, left_ms, carry
+  # input and short notices
+  var taps, tap_t, note, note_t
+  # alert, display ownership, sound health
+  var alert_t, cue_t, pinned, visible, recovered, sound_ok, sound_err
+  # graphics tables
+  var TOMATO, CUP, DIGITS, SEGIX, SMALL, BIG, EDGE
+
+  def init()
+    self.focus_s = self._setting("work", 25, 1, 180) * 60
+    self.short_s = self._setting("short", 5, 1, 60) * 60
+    self.long_s = self._setting("long", 15, 1, 120) * 60
+    self.cycles = self._setting("cycles", 4, 1, 6)
+    self.ring_s = self._setting("ring", 20, 5, 180)
+    self.auto = self._flag("auto", false)
+    self.secs = self._flag("secs", false)
+    self.pin = self._flag("pin", true)
+    self.sound_on = self._flag("sound", true)
+    self.wake = self._flag("wake", true)
+    self.tune = str(store.get("tune", "chime"))
+
+    # Progress survives restarts through the app's own store keys.
+    self.phase = self._setting("phase", 0, 0, 2)
+    self.done = self._setting("done", 0, 0, self.cycles)
+    self.ended = 0
+    self.state = 0
+    self.length_s = self._length(self.phase)
+    self.deadline = 0
+    self.left_ms = 0
+    # true while the next phase is already counting during an alert
+    self.carry = false
+
+    self.taps = 0
+    self.tap_t = 0
+    self.note = ""
+    self.note_t = -100000
+    self.alert_t = 0
+    self.cue_t = 0
+    self.pinned = false
+    self.visible = false
+    self.recovered = false
+    self.sound_ok = true
+    self.sound_err = 0
+
+    # Seven-segment digits as the letters of their lit segments.
+    self.DIGITS = ["abcdef", "bc", "abdeg", "abcdg", "bcfg",
+                   "acdfg", "acdefg", "abc", "abcdefg", "abcdfg"]
+    self.SEGIX = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6}
+    # Segment rectangles [x, y, w, h] in the order a..g.
+    self.SMALL = [[1, 0, 3, 1], [4, 1, 1, 3], [4, 5, 1, 3], [1, 8, 3, 1],
+                  [0, 5, 1, 3], [0, 1, 1, 3], [1, 4, 3, 1]]
+    self.BIG = [[2, 0, 9, 2], [11, 2, 2, 5], [11, 9, 2, 5], [2, 14, 9, 2],
+                [0, 9, 2, 5], [0, 2, 2, 5], [2, 7, 9, 2]]
+
+    # The panel's outer ring, clockwise from the top left corner. Built once
+    # so the alert border does not allocate while drawing.
+    self.EDGE = []
+    var i = 0
+    while i < 52
+      self.EDGE.push([i, 0])
+      i += 1
+    end
+    i = 1
+    while i < 16
+      self.EDGE.push([51, i])
+      i += 1
+    end
+    i = 50
+    while i >= 0
+      self.EDGE.push([i, 15])
+      i -= 1
+    end
+    i = 14
+    while i >= 1
+      self.EDGE.push([0, i])
+      i -= 1
+    end
+
+    # 13x12 pictures. R/H = tomato (drains), G = stalk,
+    # C = cup, T = tea (drains), W = steam.
+    self.TOMATO = [
+      "......G......",
+      "...GG.G.GG...",
+      "..RRGGGGGRR..",
+      ".RRRRRGRRRRR.",
+      "RRHRRRRRRRRRR",
+      "RHHRRRRRRRRRR",
+      "RHRRRRRRRRRRR",
+      "RRRRRRRRRRRRR",
+      "RRRRRRRRRRRRR",
+      ".RRRRRRRRRRR.",
+      "..RRRRRRRRR..",
+      "....RRRRR....",
+    ]
+    self.CUP = [
+      "...W...W.....",
+      "....W...W....",
+      "...W...W.....",
+      ".............",
+      "CCCCCCCCC....",
+      "CTTTTTTTCCC..",
+      "CTTTTTTTC..C.",
+      "CTTTTTTTC..C.",
+      "CTTTTTTTCCC..",
+      ".CTTTTTC.....",
+      "..CCCCC......",
+      ".............",
+    ]
+  end
+
+  def duration()
+    if self.state == 3
+      return self.ring_s * 1000
+    end
+    return 15000
+  end
+
+  # ---- settings and storage ----------------------------------------------
+
+  # Whole number from the store, clamped to a safe range.
+  def _setting(key, fallback, lo, hi)
+    var v = fallback
+    try
+      var raw = store.get(key, fallback)
+      var kind = type(raw)
+      if kind == 'int' || kind == 'real' || kind == 'string'
+        v = int(raw)
+      end
+    except ..
+      v = fallback
+    end
+    if v < lo
+      v = lo
+    elif v > hi
+      v = hi
+    end
+    return v
+  end
+
+  # Switch from the store; accepts booleans, 0/1 and "true"/"false".
+  def _flag(key, fallback)
+    var v = nil
+    try
+      v = store.get(key, fallback)
+    except ..
+      return fallback
+    end
+    if v == true || v == 1 || v == "true"
+      return true
+    end
+    if v == false || v == 0 || v == "false"
+      return false
+    end
+    return fallback
+  end
+
+  def _keep(key, value)
+    try
+      store.set(key, value)
+    except ..
+    end
+  end
+
+  def _keep_progress()
+    self._keep("phase", self.phase)
+    self._keep("done", self.done)
+  end
+
+  # Store the absolute end of a running phase so a restart can pick it up.
+  # Anything else clears it: a paused phase is not resumed after a reboot.
+  def _persist()
+    var e = epoch_ms()
+    if self.state == 1 && e > 0
+      self._keep("run_end", e / 1000 + (self.deadline - now_ms()) / 1000)
+      self._keep("run_total", self.length_s)
+    else
+      self._keep("run_end", 0)
+    end
+  end
+
+  # ---- colours ------------------------------------------------------------
+
+  # Linear blend of two 0xRRGGBB colours, weight 0 (a) .. 255 (b).
+  def _blend(a, b, w)
+    if w <= 0
+      return a
+    end
+    if w >= 255
+      return b
+    end
+    var out = 0
+    var shift = 0
+    while shift <= 16
+      var ca = (a >> shift) & 0xFF
+      var cb = (b >> shift) & 0xFF
+      out = out | (((ca * (255 - w) + cb * w) / 255) << shift)
+      shift += 8
+    end
+    return out
+  end
+
+  # Slow breathing, 0..255 over a 4 s cycle. Squared so it lingers near
+  # dark and reads as breathing rather than blinking.
+  def _breath(t)
+    var k = t % 4000
+    if k >= 2000
+      k = 4000 - k
+    end
+    k = k * 255 / 2000
+    return k * k / 255
+  end
+
+  # ---- phases -------------------------------------------------------------
+
+  def _length(p)
+    if p == 0
+      return self.focus_s
+    elif p == 1
+      return self.short_s
+    end
+    return self.long_s
+  end
+
+  def _label(p)
+    if p == 0
+      return "FOKUS"
+    elif p == 1
+      return "PAUSE"
+    end
+    return "LANGE PAUSE"
+  end
+
+  # Remaining whole seconds, rounded up so a fresh phase shows its full
+  # length and 0 is only ever seen at the very end.
+  def remaining_s(t)
+    if self.state == 1
+      var ms = self.deadline - t
+      if ms < 0
+        ms = 0
+      end
+      return (ms + 999) / 1000
+    elif self.state == 2
+      return (self.left_ms + 999) / 1000
+    elif self.state == 3
+      return 0
+    end
+    return self._length(self.phase)
+  end
+
+  # Share of the phase still left, 0..1000.
+  def _fill(t)
+    if self.length_s < 1
+      return 0
+    end
+    var ms = 0
+    if self.state == 1
+      ms = self.deadline - t
+    elif self.state == 2
+      ms = self.left_ms
+    else
+      return 1000
+    end
+    var f = ms / self.length_s
+    if f < 0
+      return 0
+    elif f > 1000
+      return 1000
+    end
+    return f
+  end
+
+  # ---- sound --------------------------------------------------------------
+
+  # RTTTL only, octaves 5..7, each alert about two seconds long so it can
+  # be heard from the next room.
+  def _melody()
+    if self.tune == "bells"
+      return "p:d=8,o=6,b=140:c7,g,e,c,4p,c7,g,e,c,4p,2c7"
+    elif self.tune == "pips"
+      return "p:d=16,o=6,b=110:a,8p,a,8p,a,8p,2a"
+    end
+    return "p:d=8,o=6,b=125:e,g,c7,4p,e,g,c7,4p,2g"
+  end
+
+  # Gives up on sound after two failed attempts in a row.
+  def _beep(song)
+    if !self.sound_on || !self.sound_ok
+      return
+    end
+    try
+      sound.play({'rtttl': song})
+      self.sound_err = 0
+    except ..
+      self.sound_err += 1
+      if self.sound_err >= 2
+        self.sound_ok = false
+      end
+    end
+  end
+
+  def _quiet()
+    try
+      sound.stop()
+    except ..
+    end
+  end
+
+  # ---- owning the display -------------------------------------------------
+
+  def _hold_rotation()
+    if !self.pinned
+      try
+        rotation.pause()
+        self.pinned = true
+      except ..
+      end
+    end
+  end
+
+  def _free_rotation()
+    if self.pinned
+      self.pinned = false
+      try
+        rotation.resume()
+      except ..
+      end
+    end
+  end
+
+  def _bring_forward()
+    try
+      rotation.show()
+    except ..
+    end
+  end
+
+  # Pin for a running phase, if enabled. Does not wake the display.
+  def _pin_on()
+    if self.pin
+      self._bring_forward()
+      self._hold_rotation()
+    end
+  end
+
+  # Take the display for an alert, regardless of the pin setting.
+  def _claim_alert()
+    if self.wake
+      try
+        display.power(true)
+      except ..
+      end
+    end
+    self._bring_forward()
+    self._hold_rotation()
+  end
+
+  # ---- transitions --------------------------------------------------------
+
+  def _begin()
+    self.length_s = self._length(self.phase)
+    self.deadline = now_ms() + self.length_s * 1000
+    self.carry = false
+    self.state = 1
+    self._persist()
+    self._pin_on()
+    self._beep("p:d=16,o=6,b=200:c,e")
+  end
+
+  def _pause()
+    var left = self.deadline - now_ms()
+    if left < 0
+      left = 0
+    end
+    self.left_ms = left
+    self.state = 2
+    self._persist()
+    self._beep("p:d=16,o=5,b=200:e,c")
+  end
+
+  def _resume()
+    var left = self.left_ms
+    if left < 1000
+      left = 1000
+    end
+    self.deadline = now_ms() + left
+    self.state = 1
+    self._persist()
+    self._beep("p:d=16,o=6,b=200:c,e")
+  end
+
+  def _cancel()
+    self.state = 0
+    self.carry = false
+    self._persist()
+    self._free_rotation()
+  end
+
+  # Move the cycle on: focus -> short/long break -> focus.
+  def _next_phase()
+    if self.phase == 0
+      self.done += 1
+      self.phase = self.done >= self.cycles ? 2 : 1
+    else
+      if self.phase == 2
+        self.done = 0
+      end
+      self.phase = 0
+    end
+    self._keep_progress()
+  end
+
+  def _complete()
+    self.ended = self.phase
+    self._next_phase()
+    self.state = 3
+    self.alert_t = now_ms()
+    self.cue_t = self.alert_t
+    self._keep("run_end", 0)
+    self.carry = self.auto
+    if self.carry
+      # The next phase starts counting now; record its deadline right away.
+      self.length_s = self._length(self.phase)
+      self.deadline = self.alert_t + self.length_s * 1000
+      var e = epoch_ms()
+      if e > 0
+        self._keep("run_end", e / 1000 + self.length_s)
+        self._keep("run_total", self.length_s)
+      end
+    end
+    self._claim_alert()
+    self._beep(self._melody())
+  end
+
+  # Finish the alert. In auto mode the next phase is already running and
+  # simply carries on; otherwise start_next decides whether it begins now.
+  def _end_alert(start_next)
+    self._quiet()
+    if self.carry
+      self.carry = false
+      self.state = 1
+      self._persist()
+      if self.pin
+        self._pin_on()
+      else
+        self._free_rotation()
+      end
+      return
+    end
+    self.state = 0
+    self._free_rotation()
+    if start_next
+      self._begin()
+    end
+  end
+
+  def _notice(text, t)
+    self.note = text
+    self.note_t = t
+  end
+
+  # ---- buttons ------------------------------------------------------------
+
+  def on_button(name)
+    # Alert: any button ends it. SELECT is consumed; LEFT/RIGHT pass through
+    # so the same press also moves on to the next app.
+    if self.state == 3
+      self.taps = 0
+      var go = name == "select"
+      self._end_alert(go)
+      return go
+    end
+    if name != "select"
+      return false
+    end
+    # Single and double presses are told apart 420 ms after the last one.
+    self.taps += 1
+    self.tap_t = now_ms()
+    return true
+  end
+
+  def _settle(t)
+    if self.taps == 0 || t - self.tap_t < 420
+      return
+    end
+    var n = self.taps
+    self.taps = 0
+    if n == 1
+      if self.state == 0
+        self._begin()
+      elif self.state == 1
+        self._pause()
+      elif self.state == 2
+        self._resume()
+      end
+    elif self.state == 1 || self.state == 2
+      self._cancel()
+      self._notice("ABGEBROCHEN", t)
+      self._beep("p:d=16,o=5,b=200:c")
+    elif self.state == 0
+      self.phase = 0
+      self.done = 0
+      self._keep_progress()
+      self._notice("RESET", t)
+      self._beep("p:d=16,o=5,b=200:c,c")
+    end
+  end
+
+  def on_show()
+    self.visible = true
+    # Back on screen during a phase: pin again.
+    if self.pin && (self.state == 1 || self.state == 2)
+      self._hold_rotation()
+    end
+  end
+
+  def on_hide()
+    self.visible = false
+    if self.state != 3
+      self._free_rotation()
+    end
+  end
+
+  # ---- background tick (about once a second, shown or not) ---------------
+
+  # Once the clock knows the date, resume a phase that was running before a
+  # restart. Deadlines more than a day away are treated as stale.
+  def _recover(t)
+    if self.recovered
+      return
+    end
+    var e = epoch_ms()
+    if e <= 0
+      return
+    end
+    self.recovered = true
+    if self.state != 0
+      return
+    end
+    var left = self._setting("run_end", 0, 0, 0x7FFFFFFF) - e / 1000
+    if left > 0 && left < 86400
+      self.length_s = self._setting("run_total", self._length(self.phase), 1, 86400)
+      self.deadline = t + left * 1000
+      self.state = 1
+      self._pin_on()
+    end
+  end
+
+  def loop()
+    var t = now_ms()
+    self._settle(t)
+    self._recover(t)
+
+    if self.state == 1 && t >= self.deadline
+      self._complete()
+    end
+
+    if self.state == 3
+      # An alert longer than the phase already running behind it: the
+      # phase wins and ends the alert.
+      if self.carry && t >= self.deadline
+        self._end_alert(true)
+        return
+      end
+      if t - self.alert_t >= self.ring_s * 1000
+        self._end_alert(false)
+        return
+      end
+      if !self.visible
+        self._claim_alert()
+      end
+      if t - self.cue_t >= 4200
+        self.cue_t = t
+        self._beep(self._melody())
+      end
+      return
+    end
+
+    if self.state == 1 && (t / 1000) % 15 == 0
+      self._persist()
+    end
+  end
+
+  # ---- drawing ------------------------------------------------------------
+
+  def _big_view()
+    return !self.secs && (self.state == 1 || self.state == 2)
+  end
+
+  # Tomato or cup. The contents sink from the top as time passes; drained
+  # pixels stay as a dark shadow.
+  def _icon(t, fill)
+    var pic = self.TOMATO
+    var top = 2
+    var rows = 10
+    if self.phase != 0
+      pic = self.CUP
+      top = 5
+      rows = 5
+    end
+    var level = top + ((1000 - fill) * rows) / 1000
+    var y = 0
+    while y < size(pic)
+      var row = pic[y]
+      var x = 0
+      while x < size(row)
+        var ch = row[x]
+        var c = -1
+        if ch == "G"
+          c = 0x3CA03C
+        elif ch == "R"
+          c = y < level ? 0x160402 : 0xE8321E
+        elif ch == "H"
+          c = y < level ? 0x160402 : 0xFF9A80
+        elif ch == "C"
+          c = 0xB8C4D8
+        elif ch == "T"
+          c = y < level ? 0x100A04 : 0xB0702C
+        elif ch == "W" && self.state == 1
+          # steam only while a break runs, breathing slowly
+          c = self._blend(0x14181E, 0x6A7890, self._breath(t))
+        end
+        if c >= 0
+          pixel(4 + x, 1 + y, c)
+        end
+        x += 1
+      end
+      y += 1
+    end
+  end
+
+  # One dot per focus phase in the set. The running one breathes; paused
+  # it glows steadily at half strength.
+  def _dots(t)
+    var i = 0
+    while i < self.cycles
+      var c = 0x160604
+      if i < self.done
+        c = 0xE8321E
+      elif i == self.done && self.phase == 0
+        if self.state == 1
+          c = self._blend(0x160604, 0xE8321E, 38 + self._breath(t) * 217 / 255)
+        elif self.state == 2
+          c = 0x8A2414
+        end
+      end
+      rect_fill(4 + i * 3, 14, 2, 2, c)
+      i += 1
+    end
+  end
+
+  # A seven-segment digit from a segment table. Lit segments get a vertical
+  # gradient from top to bottom colour; unlit ones are drawn as shadows.
+  # d < 0 draws shadows only.
+  def _digit(x, y, d, geo, h, top, bot, off)
+    var lit = [false, false, false, false, false, false, false]
+    if d >= 0 && d <= 9
+      var s = self.DIGITS[d]
+      var j = 0
+      while j < size(s)
+        lit[self.SEGIX[s[j]]] = true
+        j += 1
+      end
+    end
+    var i = 0
+    while i < 7
+      var r = geo[i]
+      var c = off
+      if lit[i]
+        c = self._blend(top, bot, ((r[1] * 2 + r[3]) * 255) / (h * 2))
+      end
+      rect_fill(x + r[0], y + r[1], r[2], r[3], c)
+      i += 1
+    end
+  end
+
+  def _caption(t)
+    if t - self.note_t < 2500
+      return self.note
+    end
+    if self.state == 3
+      if self.ended == 0
+        return "ZEIT FUER " + self._label(self.phase)
+      end
+      return "WEITER MIT FOKUS"
+    end
+    if self._big_view() || self.state == 1
+      return ""
+    end
+    if self.state == 2
+      return "HALT"
+    end
+    return "SELECT: " + self._label(self.phase)
+  end
+
+  def _readout(t, fill, alert)
+    var s = self.remaining_s(t)
+    var top = 0xFF7A5A
+    var bot = 0xC0281A
+    var off = 0x180A05
+    var bar = 0xE8321E
+    if self.phase != 0
+      top = 0x8CF0A8
+      bot = 0x2A9A50
+      off = 0x050E08
+      bar = 0x3CA03C
+    end
+
+    if self.state == 0
+      # idle: a slow pulse, so "ready" does not look like "frozen"
+      var wave = (t / 100) % 32
+      if wave > 16
+        wave = 32 - wave
+      end
+      top = self._blend(top, off, 77 + wave * 5)
+      bot = self._blend(bot, off, 77 + wave * 5)
+    elif self.state == 2
+      top = self._blend(top, off, 115)
+      bot = self._blend(bot, off, 115)
+    end
+    if alert && (t / 300) % 2 == 1
+      top = off
+      bot = off
+    end
+
+    var big = self._big_view()
+    if big
+      # Minutes only, rounded up, filling the right half: 24:59 shows 25.
+      # A leading zero stays dark.
+      var m = (s + 59) / 60
+      if m > 99
+        m = 99
+      end
+      self._digit(23, 0, m >= 10 ? m / 10 : -1, self.BIG, 16, top, bot, off)
+      self._digit(39, 0, m % 10, self.BIG, 16, top, bot, off)
+    else
+      var mm = s / 60
+      var ss = s % 60
+      if mm > 99
+        mm = 99
+      end
+      self._digit(24, 1, mm / 10, self.SMALL, 9, top, bot, off)
+      self._digit(30, 1, mm % 10, self.SMALL, 9, top, bot, off)
+      self._digit(38, 1, ss / 10, self.SMALL, 9, top, bot, off)
+      self._digit(44, 1, ss % 10, self.SMALL, 9, top, bot, off)
+      var dot = self._blend(top, bot, 102)
+      pixel(36, 3, dot)
+      pixel(36, 7, dot)
+    end
+
+    if !alert && !big
+      rect_fill(22, 0, 30, 1, self._blend(bar, 0x000000, 209))
+      var n = fill * 30 / 1000
+      if n > 0
+        rect_fill(22, 0, n, 1, bar)
+      end
+    end
+
+    var text = self._caption(t)
+    if text != ""
+      scroll_text(22, 16, 30, settings.apply_case(text), alert ? 0xFFE0C0 : 0x8FA8D8)
+    end
+  end
+
+  # Alert border: short bright dashes marching clockwise around the edge.
+  def _border(t, hi)
+    var dim = self._blend(hi, 0x000000, 217)
+    var step = t / 60
+    var i = 0
+    var n = size(self.EDGE)
+    while i < n
+      var p = self.EDGE[i]
+      pixel(p[0], p[1], ((i + n * 4 - step % n) % 11) < 4 ? hi : dim)
+      i += 1
+    end
+  end
+
+  def draw()
+    var t = now_ms()
+    self._settle(t)
+    var alert = self.state == 3
+    clear()
+    if alert
+      self._border(t, self.phase == 0 ? 0xFF6A3A : 0x4CE07A)
+    end
+    var fill = self._fill(t)
+    self._icon(t, fill)
+    self._dots(t)
+    self._readout(t, fill, alert)
+  end
+end
+
+return App()
